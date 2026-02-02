@@ -6,27 +6,53 @@ import json
 import gc
 import secrets
 import _thread
+import math
 
 # --- CONFIGURATION ---
 BASE_URL = "https://script.google.com/macros/s/AKfycbzmS90JXXehedhyzJingavVNn2IxAdfKGlQTyFq_FkeRxYsE3hbkMaef7ewlZozl_F9/exec"
 DATA_URL = BASE_URL + "?key=" + secrets.GOOGLE_KEY
 
-SAFE_HEIGHT = 140  # Limit drawing to top half
-CYCLE_SPEED = 6  # Seconds per page
-UPDATE_INTERVAL = 60  # Check for new data every minute
+SAFE_HEIGHT = 140
+CYCLE_SPEED = 8
+UPDATE_INTERVAL = 60
 
-# --- GLOBAL SHARED DATA ---
+# --- SHARED MEMORY ---
 shared_data = {
     "net_worth": "Loading...",
     "change": "...",
     "market_status": "CLOSED",
     "history": [],
-    "assets": []
+    "allocation": [],
+    "rsi": 50  # Default neutral
 }
 data_lock = _thread.allocate_lock()
 
 
-# --- CORE 1: NETWORK WORKER ---
+# --- MATH ENGINE (QUANT) ---
+def calculate_rsi(prices, period=14):
+    if len(prices) < period + 1: return 50
+    gains = []
+    losses = []
+    for i in range(1, len(prices)):
+        delta = prices[i] - prices[i - 1]
+        if delta >= 0:
+            gains.append(delta)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(delta))
+
+    # Simple Average RSI (Smoothed is better but hard with limited data)
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+
+    if avg_loss == 0: return 100
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return int(rsi)
+
+
+# --- NETWORK THREAD ---
 def network_thread():
     while True:
         try:
@@ -34,71 +60,91 @@ def network_thread():
             if response.status_code == 200:
                 new_data = json.loads(response.text)
                 response.close()
+
+                # Run Quant Math on Core 1
+                hist = new_data.get("history", [])
+                rsi_val = calculate_rsi(hist)
+
                 with data_lock:
                     shared_data["net_worth"] = new_data.get("net_worth", "Error")
                     shared_data["change"] = new_data.get("change", "0%")
                     shared_data["market_status"] = new_data.get("market_status", "CLOSED")
-                    shared_data["history"] = new_data.get("history", [])
-                    shared_data["assets"] = new_data.get("assets", [])
+                    shared_data["history"] = hist
+                    shared_data["allocation"] = new_data.get("allocation", [])
+                    shared_data["rsi"] = rsi_val
             else:
                 response.close()
         except Exception as e:
-            print("Network Error:", e)
-
+            print("Net Error:", e)
         time.sleep(UPDATE_INTERVAL)
 
-    # --- GRAPHICS ENGINE ---
 
-
+# --- GRAPHICS ENGINE ---
 def draw_gradient_bg(lcd, width, height):
-    # Renders a 'Bloomberg' Navy Blue Gradient
-    # Top: Black (0x0000) -> Bottom: Deep Blue (0x0010)
+    # Deep "Bloomberg Terminal" Gradient
     for y in range(height):
-        # We use a bitwise trick to get a blue gradient
-        # 5-6-5 RGB: Blue is the last 5 bits.
-        # We scale y to fit 0-31 range for blue intensity
-        intensity = int((y / height) * 20)
-        lcd.line(0, y, width, y, intensity)
+        # 0x0000 to 0x18E3 (Dark Slate Blue)
+        b = int((y / height) * 20)
+        g = int((y / height) * 10)
+        color = (g << 5) | b
+        lcd.line(0, y, width, y, color)
 
 
-def draw_filled_chart(lcd, data, x, y, w, h, line_color, fill_color):
-    if not data or len(data) < 2: return
+def draw_card(lcd, x, y, w, h, color):
+    # Draws a "Glass" card with rounded corners effect
+    lcd.rect(x + 2, y, w - 4, h, color)
+    lcd.rect(x, y + 2, w, h - 4, color)
+    # Bezel
+    lcd.rect(x + 2, y, w - 4, h, 0xFFFF)
+    lcd.rect(x, y + 2, w, h - 4, 0xFFFF)
 
-    max_val = max(data)
-    min_val = min(data)
-    range_val = max_val - min_val if max_val != min_val else 1
 
-    step_x = w / (len(data) - 1)
+def draw_dna_bar(lcd, allocation, x, y, w, h):
+    # Stacked Bar Chart
+    if not allocation: return
 
-    # Calculate points
-    points = []
-    for i in range(len(data)):
-        px = int(x + (i * step_x))
-        # Invert Y (Screen Y grows down)
-        py = int(y + h - ((data[i] - min_val) / range_val * h))
-        if py > SAFE_HEIGHT: py = SAFE_HEIGHT
-        points.append((px, py))
+    current_x = x
+    colors = [0x07E0, 0x07FF, 0xF81F, 0xFFE0, 0xF800]  # Green, Cyan, Purple, Yellow, Red
 
-    # 1. Draw Fill (Vertical columns)
-    for i in range(len(points) - 1):
-        x_start = points[i][0]
-        x_end = points[i + 1][0]
+    # 1. Draw The Segments
+    for i, asset in enumerate(allocation):
+        if i >= 4: break  # Max 4 segments to prevent clutter
+        seg_w = int(asset["weight"] * w)
+        if seg_w < 2: continue
 
-        # Simple interpolation for fill
-        for curr_x in range(x_start, x_end):
-            # Calculate Y at this X
-            ratio = (curr_x - x_start) / (x_end - x_start) if (x_end - x_start) != 0 else 0
-            curr_y = int(points[i][1] + (points[i + 1][1] - points[i][1]) * ratio)
+        color = colors[i % len(colors)]
+        lcd.fill_rect(current_x, y, seg_w, h, color)
 
-            # Draw vertical line from curve down to bottom axis
-            if curr_y < y + h:
-                lcd.line(curr_x, curr_y, curr_x, y + h, fill_color)
+        # Label inside bar if wide enough
+        if seg_w > 30:
+            lcd.text(asset["symbol"], current_x + 2, y + 4, 0x0000)
 
-    # 2. Draw Line on top
-    for i in range(len(points) - 1):
-        lcd.line(points[i][0], points[i][1], points[i + 1][0], points[i + 1][1], line_color)
-        # Bold effect
-        lcd.line(points[i][0], points[i][1] - 1, points[i + 1][0], points[i + 1][1] - 1, line_color)
+        current_x += seg_w
+
+    # 2. Draw Frame
+    lcd.rect(x, y, w, h, 0xFFFF)
+
+
+def draw_rsi_gauge(lcd, rsi, x, y, w):
+    # Linear Gauge
+    lcd.text(f"RSI MOMENTUM: {rsi}", x, y, 0xFFFF)
+
+    bar_y = y + 15
+    bar_h = 10
+    lcd.rect(x, bar_y, w, bar_h, 0x8410)  # Gray Track
+
+    # Color Logic
+    fill_color = 0x07E0  # Green (Neutral/Bullish)
+    if rsi > 70: fill_color = 0xF800  # Red (Overbought)
+    if rsi < 30: fill_color = 0x07FF  # Cyan (Oversold/Buy the dip)
+
+    # Fill
+    fill_w = int((rsi / 100) * w)
+    lcd.fill_rect(x, bar_y, fill_w, bar_h, fill_color)
+
+    # Markers
+    lcd.line(x + int(w * 0.3), bar_y - 2, x + int(w * 0.3), bar_y + 12, 0xFFFF)  # 30
+    lcd.line(x + int(w * 0.7), bar_y - 2, x + int(w * 0.7), bar_y + 12, 0xFFFF)  # 70
 
 
 def draw_big_char(lcd, char, x, y, color, scale):
@@ -123,102 +169,70 @@ def draw_string(lcd, string, x, y, color, scale):
 def start():
     lcd = Pico_ResTouch_LCD_3_5.LCD_3inch5()
     lcd.bl_ctrl(100)
-
-    # Launch Network Thread
     _thread.start_new_thread(network_thread, ())
 
     page = 0
-    sub_page = 0
     last_switch = time.time()
 
-    # Colors
     C_WHITE = 0xFFFF
-    C_GREEN = 0x07E0
     C_RED = 0xF800
-    C_CYAN = 0x07FF
-    C_ORANGE = 0xFD20
-    C_GRAY = 0x8410
-    C_FILL = 0x0016  # Dark blue for chart fill
+    C_GREEN = 0x07E0
 
     while True:
-        # 1. READ DATA SAFELY
         with data_lock:
             nw = shared_data["net_worth"]
             ch = shared_data["change"]
             status = shared_data["market_status"]
-            hist = list(shared_data["history"])
-            assets = list(shared_data["assets"])
+            alloc = list(shared_data["allocation"])
+            rsi = shared_data["rsi"]
 
-        # 2. DRAW BACKGROUND
+        # Background & Limit Line
         draw_gradient_bg(lcd, 480, SAFE_HEIGHT)
-        lcd.line(0, SAFE_HEIGHT, 480, SAFE_HEIGHT, C_RED)  # Limit line
+        lcd.line(0, SAFE_HEIGHT, 480, SAFE_HEIGHT, C_RED)
 
-        # 3. DRAW MARKET STATUS LIGHT
-        # Top Right Corner
-        status_color = C_GRAY
+        # Status Light
+        s_col = 0x8410  # Gray
         if status == "OPEN":
-            status_color = C_GREEN
+            s_col = C_GREEN
         elif status == "AFTER-MKT":
-            status_color = C_ORANGE
+            s_col = 0xFD20
+        lcd.fill_rect(460, 5, 10, 5, s_col)
 
-        # Draw "LED"
-        lcd.fill_rect(460, 10, 8, 8, status_color)
-
-        # 4. RENDER PAGE
-        elapsed = time.time() - last_switch
-        if elapsed > CYCLE_SPEED:
-            page += 1
-            if page > 1: page = 0
-            if page == 1 and assets:
-                sub_page = (sub_page + 1) % len(assets)
+        # PAGE LOGIC
+        if time.time() - last_switch > CYCLE_SPEED:
+            page = 1 - page
             last_switch = time.time()
 
         if page == 0:
-            # --- HOME: NET WORTH ---
-            draw_filled_chart(lcd, hist, 0, 40, 480, SAFE_HEIGHT - 40, C_CYAN, C_FILL)
+            # --- PAGE 1: THE EXECUTIVE SUMMARY ---
+            lcd.text("NET LIQUIDITY", 10, 10, 0x8410)
 
-            lcd.text("TOTAL EQUITY", 10, 10, C_GRAY)
-
-            # Auto-scale text
-            scale = 6
-            if len(nw) > 8: scale = 5
-
-            # Value
+            # Huge Value
+            scale = 7 if len(nw) < 7 else 5
             draw_string(lcd, nw, 10, 30, C_WHITE, scale)
 
-            # Change (Green or Red)
-            ch_color = C_RED if "-" in str(ch) else C_GREEN
-            lcd.text(f"Day: {ch}", 15, 90, ch_color)
+            # Allocation DNA Bar (The "Visual" Upgrade)
+            draw_dna_bar(lcd, alloc, 10, 100, 460, 20)
+
+            # Labels for DNA
+            lcd.text("PORTFOLIO DNA ->", 10, 88, 0x07FF)
 
         else:
-            # --- ASSETS: TOP MOVERS ---
-            if not assets:
-                lcd.text("Fetching Assets...", 20, 60, C_WHITE)
-            else:
-                asset = assets[sub_page]
-                sym = asset["symbol"]
-                price = asset["price"]
-                raw_pct = asset["raw_pct"]  # e.g., 0.69 or -4
+            # --- PAGE 2: THE QUANT DASHBOARD ---
+            # Top Half: RSI Indicator
+            draw_rsi_gauge(lcd, rsi, 10, 20, 220)
 
-                # Format Percentage correctly
-                pct_str = "{:.2f}%".format(raw_pct)
-                if raw_pct > 0: pct_str = "+" + pct_str
+            # Bottom Half: Top Mover Card
+            if alloc:
+                top = alloc[0]  # Largest holding
+                draw_card(lcd, 250, 10, 220, 110, 0x0000)  # Glass Card frame
+                lcd.text("TOP HOLDING", 260, 20, 0xFFFF)
+                draw_string(lcd, top["symbol"], 260, 40, C_GREEN, 4)
+                lcd.text(f"Price: {top['price']}", 260, 80, 0xFFFF)
+                lcd.text(f"Weight: {int(top['weight'] * 100)}%", 260, 95, 0x07FF)
 
-                col = C_GREEN if raw_pct >= 0 else C_RED
-
-                lcd.text(f"TOP MOVER ({sub_page + 1}/{len(assets)})", 10, 10, C_GRAY)
-
-                # Ticker
-                draw_string(lcd, sym, 10, 30, C_WHITE, 7)
-
-                # Price box
-                lcd.fill_rect(280, 40, 140, 50, col)
-                lcd.text(pct_str, 290, 55, 0x0000)  # Black text
-                lcd.text(str(price), 290, 70, 0x0000)
-
-        # 5. PROGRESS BAR
-        bw = int((elapsed / CYCLE_SPEED) * 480)
-        lcd.line(0, SAFE_HEIGHT - 2, bw, SAFE_HEIGHT - 2, C_CYAN)
+        # Progress
+        w = int(((time.time() - last_switch) / CYCLE_SPEED) * 480)
+        lcd.line(0, SAFE_HEIGHT - 2, w, SAFE_HEIGHT - 2, 0x07FF)
 
         lcd.show_up()
-        # No sleep needed (Core 0 runs UI as fast as possible)
