@@ -2,40 +2,39 @@ import Pico_ResTouch_LCD_3_5
 import time
 import framebuf
 
+# --- CONFIGURATION ---
+SAFE_HEIGHT = 140  # We only use the top 140 pixels
+CYCLE_SPEED = 5  # Seconds per page
+
 
 # --- GRAPHICS HELPERS ---
-def draw_large_text(lcd, text, x, y, size, color):
-    # This is a "hack" to draw big text by drawing rectangles for every pixel
-    # It is slow, but fine for a dashboard that doesn't move much
-    for char_index, char in enumerate(text):
-        # Get the 8x8 bitmap for this character from the built-in font
-        # (This relies on standard framebuffer font data typically not exposed easily
-        # so we will use a simpler "Pixel Doubling" approach if getting font data is hard.
-        # actually, simply drawing the text to a tiny buffer and blowing it up is easier)
-        pass
+def draw_big_char(lcd, char, x, y, color, scale=3):
+    buffer = bytearray(8)
+    fb = framebuf.FrameBuffer(buffer, 8, 8, framebuf.MONO_HLSB)
+    fb.text(char, 0, 0, 1)
+    for row in range(8):
+        line = buffer[row]
+        for col in range(8):
+            if (line >> (7 - col)) & 1:
+                lcd.fill_rect(x + (col * scale), y + (row * scale), scale, scale, color)
 
-        # SIMPLER APPROACH FOR NOW: Just draw standard text multiple times slightly offset
-    # to create a "Bold" effect, until we add a proper font library.
-    lcd.text(text, x, y, color)
-    lcd.text(text, x + 1, y, color)
-    lcd.text(text, x, y + 1, color)
-    lcd.text(text, x + 1, y + 1, color)
+
+def draw_string_huge(lcd, string, x, y, color, scale=3):
+    cursor_x = x
+    for char in string:
+        draw_big_char(lcd, char, cursor_x, y, color, scale)
+        cursor_x += (8 * scale) + 2
 
 
 def draw_chart(lcd, data, x, y, w, h, color):
-    # Draws a simple line chart from a list of numbers
-    lcd.rect(x, y, w, h, color)  # Border
-
-    if not data:
-        return
-
+    lcd.rect(x, y, w, h, color)
+    if not data: return
     max_val = max(data)
     min_val = min(data)
     range_val = max_val - min_val if max_val != min_val else 1
 
     prev_px = x
     prev_py = y + h - int((data[0] - min_val) / range_val * h)
-
     step_x = w / (len(data) - 1)
 
     for i in range(1, len(data)):
@@ -51,51 +50,40 @@ def start():
     lcd = Pico_ResTouch_LCD_3_5.LCD_3inch5()
     lcd.bl_ctrl(100)
 
-    # Mock Data for the chart (Next we will fetch this from Google Sheets)
     history_data = [710, 712, 708, 715, 716, 717]
-
-    current_screen = 0  # 0 = Summary, 1 = Graph
+    page = 0
+    last_switch = time.time()
 
     while True:
-        # 1. Check for Touch
-        touch = lcd.touch_get()
-        if touch:
-            # Simple "Debounce" - wait a bit so it doesn't flicker
-            current_screen = 1 - current_screen  # Toggle between 0 and 1
-            lcd.fill(0x0000)  # Clear screen on switch
-            time.sleep(0.5)
+        # Check if it's time to switch pages
+        if time.time() - last_switch > CYCLE_SPEED:
+            page = 1 - page  # Toggle 0 -> 1 -> 0
+            last_switch = time.time()
+            lcd.fill_rect(0, 0, 480, SAFE_HEIGHT, 0x0000)  # Clear only safe zone
 
-        # 2. Draw Screen
-        if current_screen == 0:
-            # --- SUMMARY PAGE ---
-            # Clear top area only to reduce flicker
-            lcd.fill_rect(0, 0, 480, 320, 0x0000)
+        # Draw red line to mark the "Dead Zone"
+        lcd.line(0, SAFE_HEIGHT, 480, SAFE_HEIGHT, 0xF800)
 
-            lcd.text("TOTAL NET WORTH", 20, 20, 0xFFFF)
+        if page == 0:
+            # --- PAGE 1: BIG NUMBERS ---
+            lcd.text("TOTAL NET WORTH", 10, 10, 0xFFFF)
+            draw_string_huge(lcd, "$717k", 10, 35, 0x07E0, scale=7)  # Huge text
+            lcd.text("+$6,200 (Today)", 20, 100, 0xFFFF)
 
-            # Draw a box to simulate "Big Text" area
-            lcd.fill_rect(20, 50, 5, 40, 0x07E0)  # Decorative bar
-            lcd.text("$717,085", 40, 60, 0x07E0)  # Green
-            lcd.text("+$6,200 (Today)", 40, 80, 0xFFFF)  # White
-
-            lcd.text("Tap screen for charts ->", 200, 280, 0x001F)  # Blue
+            # Progress bar for next page switch
+            bar_width = int(((time.time() - last_switch) / CYCLE_SPEED) * 480)
+            lcd.line(0, SAFE_HEIGHT - 2, bar_width, SAFE_HEIGHT - 2, 0x001F)  # Blue line
 
         else:
-            # --- CHART PAGE ---
-            lcd.fill_rect(0, 0, 480, 320, 0x0000)
-            lcd.text("7-DAY PERFORMANCE", 20, 20, 0xFFFF)
+            # --- PAGE 2: WIDE CHART ---
+            lcd.text("7-DAY PERFORMANCE", 10, 10, 0xFFFF)
+            draw_chart(lcd, history_data, 10, 25, 460, 100, 0xFFFF)
 
-            draw_chart(lcd, history_data, 40, 60, 400, 200, 0xFFFF)
+            # Progress bar
+            bar_width = int(((time.time() - last_switch) / CYCLE_SPEED) * 480)
+            lcd.line(0, SAFE_HEIGHT - 2, bar_width, SAFE_HEIGHT - 2, 0x001F)
 
-            lcd.text("<- Tap to back", 20, 280, 0x001F)
-
-        # 3. Update Display
         lcd.show_up()
 
-        # Wait a bit before next loop to save power/cpu
-        # (But check touch more often)
-        for i in range(10):
-            touch_check = lcd.touch_get()
-            if touch_check:
-                break  # Break wait loop if touched
-            time.sleep(0.1)
+        # Don't check touch anymore, it's broken
+        time.sleep(0.1)
